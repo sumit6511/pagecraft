@@ -22,6 +22,7 @@ const BIN = {
   gs: process.env.GS_BIN ?? "gs",
   qpdf: process.env.QPDF_BIN ?? "qpdf",
   ocrmypdf: process.env.OCRMYPDF_BIN ?? "ocrmypdf",
+  tesseract: process.env.TESSERACT_BIN ?? "tesseract",
 };
 
 class ExecError extends Error {
@@ -70,6 +71,19 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 }
 
 const isPdf = (b: Uint8Array) => b.length > 4 && b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46; // %PDF
+/** Damaged files sometimes have junk before the header; accept %PDF in the first 1 KB. */
+const looksLikePdf = (b: Uint8Array) => Buffer.from(b.subarray(0, 1024)).includes("%PDF");
+
+/** Identify an image by its signature rather than trusting the file name. */
+function imageExt(b: Uint8Array): string | null {
+  const ascii = (o: number, n: number) => Buffer.from(b.subarray(o, o + n)).toString("latin1");
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return ".jpg";
+  if (ascii(0, 8) === "\x89PNG\r\n\x1a\n") return ".png";
+  if (ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") return ".webp";
+  if (ascii(0, 4) === "II*\0" || ascii(0, 4) === "MM\0*") return ".tif";
+  if (ascii(0, 2) === "BM") return ".bmp";
+  return null;
+}
 
 function timedOut(err: unknown) {
   return err instanceof ExecError && err.timedOut;
@@ -89,6 +103,9 @@ async function libreOfficeConvert(input: ServerInput, target: "pdf" | "docx", im
       "--norestore",
       "--nolockcheck",
       ...(importPdf ? ["--infilter=writer_pdf_import"] : []),
+      // Open HTML in regular Writer: the default Writer/Web export drops headings
+      // and adds a blank first page on LibreOffice 7.x.
+      ...(/\.html?$/i.test(file) ? ["--infilter=HTML (StarWriter)"] : []),
       "--convert-to",
       filter.replace(/"/g, ""),
       "--outdir",
@@ -239,11 +256,131 @@ async function ocrPdf(input: ServerInput, o: Record<string, string>): Promise<Se
   });
 }
 
+const GS_BASE = ["-sDEVICE=pdfwrite", "-dSAFER", "-dNOPAUSE", "-dBATCH", "-dQUIET"];
+
+function gsFailure(input: ServerInput, err: unknown, verb: string) {
+  if (err instanceof ToolError) return err;
+  const enc = err instanceof ExecError && /password|encrypt/i.test(err.stderr);
+  return new ToolError(
+    enc
+      ? `"${input.name}" is password-protected. Unlock it first.`
+      : timedOut(err)
+        ? `"${input.name}" took too long to ${verb}.`
+        : `"${input.name}" couldn't be ${verb === "convert" ? "converted" : verb + "ed"}. It may be damaged; try Repair PDF.`,
+  );
+}
+
+async function grayscalePdf(input: ServerInput): Promise<ServerOutput> {
+  return withTempDir(async (dir) => {
+    const { stem } = safeName(input.name, ".pdf");
+    await writeFile(path.join(dir, "in.pdf"), input.bytes);
+    try {
+      await run(
+        BIN.gs,
+        [...GS_BASE, "-sColorConversionStrategy=Gray", "-dProcessColorModel=/DeviceGray", "-dOverrideICC", "-sOutputFile=out.pdf", "in.pdf"],
+        { cwd: dir, timeoutMs: 240_000 },
+      );
+    } catch (err) {
+      throw gsFailure(input, err, "convert");
+    }
+    return { name: `${stem}_grayscale.pdf`, bytes: await readFile(path.join(dir, "out.pdf")) };
+  });
+}
+
+async function repairPdf(input: ServerInput): Promise<ServerOutput> {
+  return withTempDir(async (dir) => {
+    const { stem } = safeName(input.name, ".pdf");
+    await writeFile(path.join(dir, "in.pdf"), input.bytes);
+    // qpdf rebuilds broken cross-reference tables while keeping everything else intact.
+    try {
+      const r = await qpdf(dir, ["in.pdf", "out.pdf"]);
+      const note = r.code === 3 ? "Problems found and repaired." : "No damage found; the file was rewritten cleanly.";
+      return { name: `${stem}_repaired.pdf`, bytes: await readFile(path.join(dir, "out.pdf")), note };
+    } catch (err) {
+      if (err instanceof ToolError) throw err;
+      if (err instanceof ExecError && /password/i.test(err.stderr)) {
+        throw new ToolError(`"${input.name}" is password-protected. Unlock it first.`);
+      }
+    }
+    // Fall back to Ghostscript, which re-renders whatever content it can still read.
+    try {
+      await run(BIN.gs, [...GS_BASE, "-sOutputFile=out.pdf", "in.pdf"], { cwd: dir, timeoutMs: 240_000 });
+      return {
+        name: `${stem}_repaired.pdf`,
+        bytes: await readFile(path.join(dir, "out.pdf")),
+        note: "Heavily damaged; recovered what could be read. Check the result.",
+      };
+    } catch {
+      throw new ToolError(`"${input.name}" is too badly damaged to recover.`);
+    }
+  });
+}
+
+async function pdfToPdfa(input: ServerInput): Promise<ServerOutput> {
+  return withTempDir(async (dir) => {
+    const { stem } = safeName(input.name, ".pdf");
+    await writeFile(path.join(dir, "in.pdf"), input.bytes);
+    try {
+      // --tesseract-timeout 0 turns OCR off, so this is a pure PDF/A conversion.
+      await run(
+        BIN.ocrmypdf,
+        ["--skip-text", "--tesseract-timeout", "0", "--output-type", "pdfa-2", "--jobs", "2", "in.pdf", "out.pdf"],
+        { cwd: dir, timeoutMs: 300_000, env: { ...process.env, HOME: dir } },
+      );
+    } catch (err) {
+      if (err instanceof ToolError) throw err;
+      const e = err as ExecError;
+      // ocrmypdf exit codes: 8 = encrypted, 10 = PDF/A conversion failed.
+      if (e.code === 8) throw new ToolError(`"${input.name}" is password-protected. Unlock it first.`);
+      if (e.code === 10) throw new ToolError(`"${input.name}" couldn't be made PDF/A compliant. Try Repair PDF first.`);
+      throw new ToolError(timedOut(err) ? `"${input.name}" took too long to convert.` : `"${input.name}" couldn't be converted.`);
+    }
+    return { name: `${stem}_pdfa.pdf`, bytes: await readFile(path.join(dir, "out.pdf")), note: "PDF/A-2b" };
+  });
+}
+
+async function imageToText(input: ServerInput, o: Record<string, string>): Promise<ServerOutput> {
+  const ext = imageExt(input.bytes);
+  if (!ext) throw new ToolError(`"${input.name}" isn't a supported image (JPG, PNG, WebP, TIFF or BMP).`);
+  const lang = OCR_LANGS.has(o.language) ? o.language : "eng";
+  return withTempDir(async (dir) => {
+    const { stem } = safeName(input.name, ext);
+    await writeFile(path.join(dir, `in${ext}`), input.bytes);
+    let text: string;
+    try {
+      ({ stdout: text } = await run(BIN.tesseract, [`in${ext}`, "stdout", "-l", lang], {
+        cwd: dir,
+        timeoutMs: 120_000,
+        env: { ...process.env, OMP_THREAD_LIMIT: "1" },
+      }));
+    } catch (err) {
+      if (err instanceof ToolError) throw err;
+      throw new ToolError(timedOut(err) ? `"${input.name}" took too long to read.` : `Couldn't read text from "${input.name}".`);
+    }
+    const clean = text.replace(/\f/g, "").trim();
+    return {
+      name: `${stem}.txt`,
+      bytes: new TextEncoder().encode(clean + "\n"),
+      note: clean ? undefined : "No text found in this image.",
+    };
+  });
+}
+
+/** What each server tool expects as input. */
+const INPUT_KIND: Record<string, "pdf" | "damaged-pdf" | "office" | "image"> = {
+  "office-to-pdf": "office",
+  "image-to-text": "image",
+  "repair-pdf": "damaged-pdf",
+};
+
 export async function runServerTool(tool: ToolDef, inputs: ServerInput[], opts: Record<string, string>): Promise<ServerOutput[]> {
   const out: ServerOutput[] = [];
+  const kind = INPUT_KIND[tool.slug] ?? "pdf";
   for (const input of inputs) {
-    const wantsPdf = tool.slug !== "office-to-pdf";
-    if (wantsPdf && !isPdf(input.bytes)) throw new ToolError(`"${input.name}" isn't a PDF.`);
+    if (kind === "pdf" && !isPdf(input.bytes)) throw new ToolError(`"${input.name}" isn't a PDF.`);
+    if (kind === "damaged-pdf" && !looksLikePdf(input.bytes)) {
+      throw new ToolError(`"${input.name}" doesn't look like a PDF at all, so it can't be repaired.`);
+    }
     switch (tool.slug) {
       case "office-to-pdf":
         out.push(await libreOfficeConvert(input, "pdf", false));
@@ -253,6 +390,18 @@ export async function runServerTool(tool: ToolDef, inputs: ServerInput[], opts: 
         break;
       case "compress-pdf":
         out.push(await compressPdf(input, opts));
+        break;
+      case "grayscale-pdf":
+        out.push(await grayscalePdf(input));
+        break;
+      case "repair-pdf":
+        out.push(await repairPdf(input));
+        break;
+      case "pdf-to-pdfa":
+        out.push(await pdfToPdfa(input));
+        break;
+      case "image-to-text":
+        out.push(await imageToText(input, opts));
         break;
       case "protect-pdf":
         out.push(await protectPdf(input, opts));
@@ -285,11 +434,12 @@ export async function checkBinaries() {
       return false;
     }
   };
-  const [soffice, gs, qpdfOk, ocr] = await Promise.all([
+  const [soffice, gs, qpdfOk, ocr, tess] = await Promise.all([
     probe(BIN.soffice, ["--version"]),
     probe(BIN.gs, ["--version"]),
     probe(BIN.qpdf, ["--version"]),
     probe(BIN.ocrmypdf, ["--version"]),
+    probe(BIN.tesseract, ["--version"]),
   ]);
-  return { soffice, gs, qpdf: qpdfOk, ocrmypdf: ocr, tmp: (await stat(tmpdir())).isDirectory() };
+  return { soffice, gs, qpdf: qpdfOk, ocrmypdf: ocr, tesseract: tess, tmp: (await stat(tmpdir())).isDirectory() };
 }

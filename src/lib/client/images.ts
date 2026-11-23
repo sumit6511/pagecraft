@@ -267,3 +267,89 @@ export async function removeMetadata(files: File[]): Promise<Output[]> {
   }
   return out;
 }
+
+// ── Rotate / flip ──────────────────────────────────────────────────────────
+
+export async function rotateImages(files: File[], o: Record<string, string>): Promise<Output[]> {
+  const angle = [0, 90, 180, 270].includes(Number(o.angle)) ? Number(o.angle) : 90;
+  const flip = o.flip === "horizontal" || o.flip === "vertical" ? o.flip : "none";
+  if (angle === 0 && flip === "none") throw new ToolError("Choose a rotation or a flip.");
+  const out: Output[] = [];
+  for (const file of files) {
+    const { canvas: src } = await decodeImage(file);
+    const quarter = angle === 90 || angle === 270;
+    const c = document.createElement("canvas");
+    c.width = quarter ? src.height : src.width;
+    c.height = quarter ? src.width : src.height;
+    const ctx = c.getContext("2d")!;
+    ctx.translate(c.width / 2, c.height / 2);
+    ctx.rotate((angle * Math.PI) / 180);
+    ctx.scale(flip === "horizontal" ? -1 : 1, flip === "vertical" ? -1 : 1);
+    ctx.drawImage(src, -src.width / 2, -src.height / 2);
+    const f = formatOf(file) ?? "png";
+    out.push({ name: `${baseName(file.name)}_rotated.${ext(f)}`, blob: await encode(c, f, 0.95) });
+  }
+  return out;
+}
+
+// ── Text watermark ─────────────────────────────────────────────────────────
+
+export async function watermarkImages(files: File[], o: Record<string, string>): Promise<Output[]> {
+  const text = (o.text ?? "").trim();
+  if (!text) throw new ToolError("Enter the watermark text.");
+  const sizePct = Math.min(20, Math.max(2, Number(o.size) || 5)) / 100;
+  const alpha = Math.min(1, Math.max(0.1, (Number(o.opacity) || 60) / 100));
+  const color = /^#[0-9a-f]{6}$/i.test(o.color ?? "") ? o.color : "#ffffff";
+  const out: Output[] = [];
+  for (const file of files) {
+    const { canvas } = await decodeImage(file);
+    const ctx = canvas.getContext("2d")!;
+    const W = canvas.width;
+    const H = canvas.height;
+    const px = Math.max(10, Math.round(W * sizePct));
+    ctx.font = `600 ${px}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = color;
+    // A soft shadow keeps light text readable on light photos and vice versa.
+    ctx.shadowColor = isLight(color) ? "rgba(0,0,0,0.45)" : "rgba(255,255,255,0.45)";
+    ctx.shadowBlur = px * 0.15;
+    const tw = ctx.measureText(text).width;
+    const margin = Math.round(Math.min(W, H) * 0.03);
+    const pos = o.position ?? "bottom-right";
+
+    if (pos === "diagonal" || pos === "tile") {
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      const angle = -Math.atan2(H, W);
+      if (pos === "diagonal") {
+        ctx.translate(W / 2, H / 2);
+        ctx.rotate(angle);
+        ctx.fillText(text, 0, 0);
+      } else {
+        ctx.rotate(angle);
+        const stepX = tw + px * 3;
+        const stepY = px * 4;
+        const reach = Math.hypot(W, H);
+        for (let y = -reach; y < reach; y += stepY) {
+          const offset = (Math.round(y / stepY) % 2) * (stepX / 2);
+          for (let x = -reach; x < reach; x += stepX) ctx.fillText(text, x + offset, y);
+        }
+      }
+    } else {
+      const [v, h] = pos === "center" ? ["middle", "center"] : pos.split("-");
+      ctx.textAlign = h === "left" ? "left" : h === "right" ? "right" : "center";
+      ctx.textBaseline = v === "top" ? "top" : v === "bottom" ? "alphabetic" : "middle";
+      const x = h === "left" ? margin : h === "right" ? W - margin : W / 2;
+      const y = v === "top" ? margin : v === "bottom" ? H - margin : H / 2;
+      ctx.fillText(text, x, y);
+    }
+    const f = formatOf(file) ?? "png";
+    out.push({ name: `${baseName(file.name)}_watermarked.${ext(f)}`, blob: await encode(canvas, f, 0.92) });
+  }
+  return out;
+}
+
+function isLight(hex: string) {
+  const n = parseInt(hex.slice(1), 16);
+  return 0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255) > 150;
+}

@@ -1,6 +1,6 @@
 "use client";
 
-import { PDFDocument, PDFFont, PDFPage, StandardFonts, degrees, rgb } from "pdf-lib";
+import { PDFDict, PDFDocument, PDFFont, PDFName, PDFNull, PDFPage, PDFRef, StandardFonts, degrees, rgb } from "pdf-lib";
 import { ToolError, baseName, parsePageGroups, parsePageSet } from "../pages";
 import { decodeImage, readJpegOrientation } from "./images";
 import type { Output } from "./types";
@@ -20,7 +20,20 @@ export async function loadPdf(file: File | Uint8Array, label = "This file") {
   }
 }
 
+/**
+ * pdf-lib can leave unused object numbers behind (form flattening does), which
+ * makes poppler-based viewers report "Invalid XRef entry". Fill the gaps with
+ * null objects so the cross-reference table is contiguous.
+ */
+function fillObjectGaps(doc: PDFDocument) {
+  const used = new Set(doc.context.enumerateIndirectObjects().map(([ref]) => ref.objectNumber));
+  for (let n = 1; n <= doc.context.largestObjectNumber; n++) {
+    if (!used.has(n)) doc.context.assign(PDFRef.of(n), PDFNull);
+  }
+}
+
 async function save(doc: PDFDocument, name: string): Promise<Output> {
+  fillObjectGaps(doc);
   const bytes = await doc.save({ useObjectStreams: true });
   return { name, blob: new Blob([bytes as BlobPart], { type: PDF }) };
 }
@@ -331,4 +344,169 @@ export async function imagesToPdf(files: File[], o: Record<string, string>): Pro
   }
   const name = files.length === 1 ? `${baseName(files[0].name)}.pdf` : "images.pdf";
   return [await save(doc, name)];
+}
+
+// ── Pages per sheet (N-up) ─────────────────────────────────────────────────
+
+const GRIDS: Record<number, [number, number][]> = {
+  2: [[2, 1], [1, 2]],
+  4: [[2, 2]],
+  6: [[3, 2], [2, 3]],
+  9: [[3, 3]],
+};
+
+export async function pagesPerSheet(file: File, o: Record<string, string>): Promise<Output[]> {
+  const n = Number(o.perSheet) || 2;
+  const src = await loadPdf(file);
+  const out = await PDFDocument.create();
+  const pages = src.getPages();
+  const embedded = await out.embedPages(pages);
+  const [sw, sh] = PAGE_SIZES[o.size === "letter" ? "letter" : "a4"];
+  const margin = 18;
+  const gap = 10;
+
+  // Pick the grid + orientation where the first page comes out largest.
+  const first = visualSize(pages[0]);
+  const orientations: [number, number][] =
+    o.orientation === "portrait" ? [[sw, sh]] : o.orientation === "landscape" ? [[sh, sw]] : [[sw, sh], [sh, sw]];
+  let best: { cols: number; rows: number; W: number; H: number; scale: number } = { cols: 1, rows: 1, W: sw, H: sh, scale: 0 };
+  for (const [W, H] of orientations) {
+    for (const [cols, rows] of GRIDS[n] ?? GRIDS[2]) {
+      const cw = (W - margin * 2 - gap * (cols - 1)) / cols;
+      const ch = (H - margin * 2 - gap * (rows - 1)) / rows;
+      const scale = Math.min(cw / first.w, ch / first.h);
+      if (scale > best.scale) best = { cols, rows, W, H, scale };
+    }
+  }
+  const { cols, rows, W, H } = best;
+  const cw = (W - margin * 2 - gap * (cols - 1)) / cols;
+  const ch = (H - margin * 2 - gap * (rows - 1)) / rows;
+
+  let sheet: PDFPage | null = null;
+  pages.forEach((page, i) => {
+    const slot = i % (cols * rows);
+    if (slot === 0) sheet = out.addPage([W, H]);
+    const col = slot % cols;
+    const row = Math.floor(slot / cols);
+    const { w: vw, h: vh, r } = visualSize(page);
+    const s = Math.min(cw / vw, ch / vh);
+    const dw = vw * s;
+    const dh = vh * s;
+    // Cell origin (bottom-left), filling left→right, top→bottom; centre the page in its cell.
+    const cx = margin + col * (cw + gap) + (cw - dw) / 2;
+    const cy = H - margin - (row + 1) * ch - row * gap + (ch - dh) / 2;
+    // Embedded pages ignore /Rotate, so rotate them back to how they're displayed.
+    const origin =
+      r === 90 ? { x: cx, y: cy + dh } : r === 180 ? { x: cx + dw, y: cy + dh } : r === 270 ? { x: cx + dw, y: cy } : { x: cx, y: cy };
+    const { width, height } = page.getSize();
+    sheet!.drawPage(embedded[i], { x: origin.x, y: origin.y, width: width * s, height: height * s, rotate: degrees(-r) });
+    if (o.border === "true") {
+      sheet!.drawRectangle({ x: cx, y: cy, width: dw, height: dh, borderColor: rgb(0.6, 0.6, 0.6), borderWidth: 0.6 });
+    }
+  });
+  return [await save(out, `${baseName(file.name)}_${n}-up.pdf`)];
+}
+
+// ── Crop margins ───────────────────────────────────────────────────────────
+
+const MM = 72 / 25.4;
+
+export async function cropPdf(files: File[], o: Record<string, string>): Promise<Output[]> {
+  const T = (Number(o.top) || 0) * MM;
+  const B = (Number(o.bottom) || 0) * MM;
+  const L = (Number(o.left) || 0) * MM;
+  const R = (Number(o.right) || 0) * MM;
+  if (T + B + L + R === 0) throw new ToolError("Enter at least one margin to trim.");
+  const outputs: Output[] = [];
+  for (const file of files) {
+    const doc = await loadPdf(file, `"${file.name}"`);
+    const pages = doc.getPages();
+    for (const i of parsePageSet(o.pages ?? "", pages.length)) {
+      const page = pages[i];
+      // Margins are given for the page as displayed; map them to the unrotated box.
+      const r = norm(page.getRotation().angle);
+      const m =
+        r === 90
+          ? { l: T, t: R, r: B, b: L }
+          : r === 180
+            ? { l: R, t: B, r: L, b: T }
+            : r === 270
+              ? { l: B, t: L, r: T, b: R }
+              : { l: L, t: T, r: R, b: B };
+      const box = page.getCropBox();
+      const w = box.width - m.l - m.r;
+      const h = box.height - m.t - m.b;
+      if (w < 36 || h < 36) {
+        throw new ToolError(`Those margins would leave almost nothing of page ${i + 1} in "${file.name}".`);
+      }
+      page.setMediaBox(box.x + m.l, box.y + m.b, w, h);
+      page.setCropBox(box.x + m.l, box.y + m.b, w, h);
+    }
+    outputs.push(await save(doc, `${baseName(file.name)}_cropped.pdf`));
+  }
+  return outputs;
+}
+
+// ── Flatten forms ──────────────────────────────────────────────────────────
+
+export async function flattenPdf(files: File[]): Promise<Output[]> {
+  const outputs: Output[] = [];
+  for (const file of files) {
+    const doc = await loadPdf(file, `"${file.name}"`);
+    const form = doc.getForm();
+    const count = form.getFields().length;
+    if (count === 0) {
+      outputs.push({ name: file.name, blob: file, note: "No form fields found; the file is unchanged." });
+      continue;
+    }
+    try {
+      form.flatten();
+    } catch {
+      throw new ToolError(`The form in "${file.name}" couldn't be flattened. It may use an unsupported field type.`);
+    }
+    const out = await save(doc, `${baseName(file.name)}_flattened.pdf`);
+    outputs.push({ ...out, note: `${count} field${count === 1 ? "" : "s"} flattened` });
+  }
+  return outputs;
+}
+
+// ── Metadata ───────────────────────────────────────────────────────────────
+
+export async function readMetadata(file: File): Promise<Record<string, string>> {
+  const doc = await loadPdf(file);
+  return {
+    title: doc.getTitle() ?? "",
+    author: doc.getAuthor() ?? "",
+    subject: doc.getSubject() ?? "",
+    keywords: doc.getKeywords() ?? "",
+  };
+}
+
+export async function editMetadata(file: File, o: Record<string, string>): Promise<Output[]> {
+  const doc = await loadPdf(file);
+  const info = () => {
+    const ref = doc.context.trailerInfo.Info;
+    return ref ? doc.context.lookupMaybe(ref, PDFDict) : undefined;
+  };
+  const setOrDelete = (key: string, value: string | undefined, set: (v: string) => void) => {
+    const v = (value ?? "").trim();
+    if (v) set(v);
+    else info()?.delete(PDFName.of(key));
+  };
+  setOrDelete("Title", o.title, (v) => doc.setTitle(v));
+  setOrDelete("Author", o.author, (v) => doc.setAuthor(v));
+  setOrDelete("Subject", o.subject, (v) => doc.setSubject(v));
+  setOrDelete("Keywords", o.keywords, (v) =>
+    doc.setKeywords(v.split(",").map((k) => k.trim()).filter(Boolean)),
+  );
+  if (o.stripTech === "true") {
+    for (const k of ["Creator", "Producer", "CreationDate", "ModDate"]) info()?.delete(PDFName.of(k));
+  } else {
+    doc.setModificationDate(new Date());
+  }
+  // An XMP packet would keep showing the old values in many viewers, so drop it.
+  const hadXmp = doc.catalog.has(PDFName.of("Metadata"));
+  doc.catalog.delete(PDFName.of("Metadata"));
+  const out = await save(doc, file.name);
+  return [{ ...out, note: hadXmp ? "Old XMP metadata was removed so the new values take effect." : undefined }];
 }

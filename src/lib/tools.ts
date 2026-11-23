@@ -63,6 +63,8 @@ export interface ToolDef {
   /** Let the user reorder files (order matters for the output). */
   orderable?: boolean;
   editor?: Editor;
+  /** Fill the options from the chosen file (see prefillOptions in lib/client/run.ts). */
+  prefill?: boolean;
   fields: Field[];
   action: string;
 }
@@ -79,7 +81,7 @@ export const ACCEPT = {
   pdf: "application/pdf,.pdf",
   image: "image/jpeg,image/png,image/webp,image/gif,image/bmp,.jpg,.jpeg,.png,.webp,.gif,.bmp",
   office:
-    ".doc,.docx,.odt,.rtf,.txt,.xls,.xlsx,.ods,.csv,.ppt,.pptx,.odp",
+    ".doc,.docx,.odt,.rtf,.txt,.xls,.xlsx,.ods,.csv,.ppt,.pptx,.odp,.html,.htm",
 } as const;
 
 const PAGES_FIELD: Field = {
@@ -89,6 +91,8 @@ const PAGES_FIELD: Field = {
   placeholder: "All pages, or e.g. 1-3, 5, 8-",
   default: "",
 };
+
+const IMAGE_SCAN = "image/jpeg,image/png,image/webp,image/tiff,image/bmp,.jpg,.jpeg,.png,.webp,.tif,.tiff,.bmp";
 
 const POSITION_OPTIONS = [
   { value: "bottom-center", label: "Bottom center" },
@@ -222,6 +226,53 @@ export const TOOLS: ToolDef[] = [
     ],
     action: "Extract pages",
   },
+  {
+    slug: "pages-per-sheet",
+    name: "Pages per sheet",
+    summary: "Print several pages on one sheet (2, 4, 6 or 9-up).",
+    category: "organize",
+    runtime: "client",
+    accept: ACCEPT.pdf,
+    multiple: false,
+    minFiles: 1,
+    fields: [
+      {
+        type: "select",
+        name: "perSheet",
+        label: "Pages per sheet",
+        default: "2",
+        options: [
+          { value: "2", label: "2" },
+          { value: "4", label: "4" },
+          { value: "6", label: "6" },
+          { value: "9", label: "9" },
+        ],
+      },
+      {
+        type: "select",
+        name: "size",
+        label: "Sheet size",
+        default: "a4",
+        options: [
+          { value: "a4", label: "A4" },
+          { value: "letter", label: "US Letter" },
+        ],
+      },
+      {
+        type: "select",
+        name: "orientation",
+        label: "Orientation",
+        default: "auto",
+        options: [
+          { value: "auto", label: "Auto (largest pages)" },
+          { value: "portrait", label: "Portrait" },
+          { value: "landscape", label: "Landscape" },
+        ],
+      },
+      { type: "checkbox", name: "border", label: "Draw a border around each page", default: "false" },
+    ],
+    action: "Create sheets",
+  },
 
   // ── Convert ─────────────────────────────────────────────────────────────
   {
@@ -311,7 +362,7 @@ export const TOOLS: ToolDef[] = [
   {
     slug: "office-to-pdf",
     name: "Office to PDF",
-    summary: "Convert Word, Excel, PowerPoint and OpenDocument files to PDF.",
+    summary: "Convert Word, Excel, PowerPoint, OpenDocument and HTML files to PDF.",
     category: "convert",
     runtime: "server",
     accept: ACCEPT.office,
@@ -331,6 +382,53 @@ export const TOOLS: ToolDef[] = [
     minFiles: 1,
     fields: [],
     action: "Convert to Word",
+  },
+  {
+    slug: "pdf-to-text",
+    name: "PDF to text",
+    summary: "Extract the text of a PDF into a plain .txt file.",
+    category: "convert",
+    runtime: "client",
+    accept: ACCEPT.pdf,
+    multiple: true,
+    minFiles: 1,
+    fields: [
+      PAGES_FIELD,
+      { type: "checkbox", name: "separators", label: "Mark where each page starts", default: "true" },
+    ],
+    action: "Extract text",
+  },
+  {
+    slug: "pdf-to-pdfa",
+    name: "PDF to PDF/A",
+    summary: "Convert to PDF/A-2b for long-term archiving.",
+    category: "convert",
+    runtime: "server",
+    accept: ACCEPT.pdf,
+    multiple: true,
+    minFiles: 1,
+    fields: [],
+    action: "Convert to PDF/A",
+  },
+  {
+    slug: "image-to-text",
+    name: "Image to text",
+    summary: "Read the text in photos and screenshots (OCR).",
+    category: "convert",
+    runtime: "server",
+    accept: IMAGE_SCAN,
+    multiple: true,
+    minFiles: 1,
+    fields: [
+      {
+        type: "select",
+        name: "language",
+        label: "Text language",
+        default: "eng",
+        options: [{ value: "eng", label: "English" }],
+      },
+    ],
+    action: "Extract text",
   },
 
   // ── Image ───────────────────────────────────────────────────────────────
@@ -460,6 +558,71 @@ export const TOOLS: ToolDef[] = [
     action: "Crop image",
   },
   {
+    slug: "rotate-image",
+    name: "Rotate & flip image",
+    summary: "Turn images by 90° steps or mirror them.",
+    category: "image",
+    runtime: "client",
+    accept: ACCEPT.image,
+    multiple: true,
+    minFiles: 1,
+    fields: [
+      {
+        type: "select",
+        name: "angle",
+        label: "Rotate",
+        default: "90",
+        options: [
+          { value: "0", label: "Don't rotate" },
+          { value: "90", label: "90° clockwise" },
+          { value: "180", label: "180°" },
+          { value: "270", label: "90° counter-clockwise" },
+        ],
+      },
+      {
+        type: "select",
+        name: "flip",
+        label: "Flip",
+        default: "none",
+        options: [
+          { value: "none", label: "Don't flip" },
+          { value: "horizontal", label: "Horizontally (mirror)" },
+          { value: "vertical", label: "Vertically" },
+        ],
+      },
+    ],
+    action: "Apply",
+  },
+  {
+    slug: "watermark-image",
+    name: "Watermark image",
+    summary: "Stamp text on your photos and graphics.",
+    category: "image",
+    runtime: "client",
+    accept: ACCEPT.image,
+    multiple: true,
+    minFiles: 1,
+    fields: [
+      { type: "text", name: "text", label: "Watermark text", default: "© Your name", required: true },
+      {
+        type: "select",
+        name: "position",
+        label: "Position",
+        default: "bottom-right",
+        options: [
+          { value: "diagonal", label: "Diagonal, centered" },
+          { value: "center", label: "Centered" },
+          { value: "tile", label: "Tiled across the image" },
+          ...POSITION_OPTIONS,
+        ],
+      },
+      { type: "range", name: "size", label: "Text size", min: 2, max: 20, step: 1, default: "5", suffix: "% of width" },
+      { type: "range", name: "opacity", label: "Opacity", min: 10, max: 100, step: 5, default: "60", suffix: "%" },
+      { type: "color", name: "color", label: "Color", default: "#ffffff" },
+    ],
+    action: "Add watermark",
+  },
+  {
     slug: "remove-metadata",
     name: "Remove image metadata",
     summary: "Strip EXIF data such as GPS location and camera details.",
@@ -544,6 +707,60 @@ export const TOOLS: ToolDef[] = [
     fields: [],
     action: "Apply signature",
   },
+  {
+    slug: "crop-pdf",
+    name: "Crop PDF",
+    summary: "Trim the margins of PDF pages.",
+    category: "edit",
+    runtime: "client",
+    accept: ACCEPT.pdf,
+    multiple: true,
+    minFiles: 1,
+    fields: [
+      { type: "number", name: "top", label: "Top", min: 0, max: 500, default: "10", suffix: "mm" },
+      { type: "number", name: "bottom", label: "Bottom", min: 0, max: 500, default: "10", suffix: "mm" },
+      { type: "number", name: "left", label: "Left", min: 0, max: 500, default: "10", suffix: "mm" },
+      { type: "number", name: "right", label: "Right", min: 0, max: 500, default: "10", suffix: "mm" },
+      PAGES_FIELD,
+    ],
+    action: "Crop pages",
+  },
+  {
+    slug: "flatten-pdf",
+    name: "Flatten PDF forms",
+    summary: "Lock filled-in form fields so they can't be edited.",
+    category: "edit",
+    runtime: "client",
+    accept: ACCEPT.pdf,
+    multiple: true,
+    minFiles: 1,
+    fields: [],
+    action: "Flatten forms",
+  },
+  {
+    slug: "edit-metadata",
+    name: "Edit PDF metadata",
+    summary: "Change or remove the title, author and other document properties.",
+    category: "edit",
+    runtime: "client",
+    accept: ACCEPT.pdf,
+    multiple: false,
+    minFiles: 1,
+    prefill: true,
+    fields: [
+      { type: "text", name: "title", label: "Title", placeholder: "Empty removes it", default: "" },
+      { type: "text", name: "author", label: "Author", placeholder: "Empty removes it", default: "" },
+      { type: "text", name: "subject", label: "Subject", placeholder: "Empty removes it", default: "" },
+      { type: "text", name: "keywords", label: "Keywords", placeholder: "Comma-separated", default: "" },
+      {
+        type: "checkbox",
+        name: "stripTech",
+        label: "Also remove creator app, producer and dates",
+        default: "false",
+      },
+    ],
+    action: "Save metadata",
+  },
 
   // ── Optimize & secure ───────────────────────────────────────────────────
   {
@@ -569,6 +786,30 @@ export const TOOLS: ToolDef[] = [
       },
     ],
     action: "Compress PDF",
+  },
+  {
+    slug: "grayscale-pdf",
+    name: "Grayscale PDF",
+    summary: "Convert every page to black and white to save ink.",
+    category: "secure",
+    runtime: "server",
+    accept: ACCEPT.pdf,
+    multiple: true,
+    minFiles: 1,
+    fields: [],
+    action: "Convert to grayscale",
+  },
+  {
+    slug: "repair-pdf",
+    name: "Repair PDF",
+    summary: "Recover damaged or corrupted PDF files.",
+    category: "secure",
+    runtime: "server",
+    accept: ACCEPT.pdf,
+    multiple: true,
+    minFiles: 1,
+    fields: [],
+    action: "Repair PDF",
   },
   {
     slug: "protect-pdf",

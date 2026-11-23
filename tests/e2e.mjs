@@ -30,6 +30,8 @@ async function check(name, fn) {
     results.push(["FAIL", name, e.message.split("\n")[0]]);
     await page.screenshot({ path: `${OUT}/${name}.fail.png` });
   }
+  const [s, n, d] = results.at(-1);
+  console.log(`${s}  ${n.padEnd(30)} ${d}`); // stream progress as we go
 }
 const pdfInfo = async (file) => {
   const d = await PDFDocument.load(readFileSync(file));
@@ -50,6 +52,11 @@ async function runAndDownload(actionName, { zip = false } = {}) {
   ]);
   const file = path.join(OUT, dl.suggestedFilename());
   await dl.saveAs(file);
+  if (file.endsWith(".pdf")) {
+    // Every PDF we produce must open in poppler without warnings.
+    const errs = execFileSync("sh", ["-c", 'pdfinfo "$1" 2>&1 >/dev/null', "sh", file]).toString().trim();
+    if (errs) throw new Error(`${path.basename(file)} is malformed: ${errs}`);
+  }
   return file;
 }
 const setField = (label, value) => page.getByLabel(label, { exact: true }).fill(value);
@@ -58,7 +65,7 @@ const selectField = (label, value) => page.getByLabel(label, { exact: true }).se
 await check("home", async () => {
   await page.goto(BASE);
   const n = await page.locator('a[href^="/tools/"]').count();
-  if (n !== 22) throw new Error(`expected 22 tool cards, got ${n}`);
+  if (n !== 33) throw new Error(`expected 33 tool cards, got ${n}`);
   await page.getByPlaceholder("Search tools").fill("sign");
   const m = await page.locator('a[href^="/tools/"]').count();
   if (m !== 1) throw new Error(`search: expected 1, got ${m}`);
@@ -237,6 +244,110 @@ await check("sign-pdf", async () => {
   return `${imgs} signature placements`;
 });
 
+await check("pages-per-sheet", async () => {
+  await open("pages-per-sheet", ["sample.pdf"]);
+  await selectField("Pages per sheet", "4");
+  const f = await runAndDownload("Create sheets");
+  const i = await pdfInfo(f);
+  if (i.pages !== 1) throw new Error(`sheets=${i.pages}`);
+  execFileSync("pdftoppm", ["-png", "-r", "40", f, `${OUT}/nup`]);
+  const text = execFileSync("pdftotext", [f, "-"]).toString();
+  if (!/Sample page 1/.test(text) || !/Sample page 3/.test(text)) throw new Error(text.slice(0, 120));
+  return "3 pages on 1 sheet";
+});
+
+await check("pdf-to-text", async () => {
+  await open("pdf-to-text", ["sample.pdf"]);
+  const f = await runAndDownload("Extract text");
+  const t = readFileSync(f, "utf8");
+  if (!t.includes("Sample page 2") || !t.includes("Page 3 ────")) throw new Error(t.slice(0, 120));
+  return `${t.split("\n").length} lines`;
+});
+
+await check("crop-pdf", async () => {
+  await open("crop-pdf", ["sample.pdf"]);
+  const f = await runAndDownload("Crop pages");
+  const d = await PDFDocument.load(readFileSync(f));
+  const sizes = d.getPages().map((p) => p.getSize());
+  const want = 595 - 2 * 10 * (72 / 25.4);
+  if (Math.abs(sizes[0].width - want) > 0.5) throw new Error(JSON.stringify(sizes));
+  execFileSync("pdftoppm", ["-png", "-r", "40", f, `${OUT}/crop`]);
+  return `page 1 ${sizes[0].width.toFixed(1)}×${sizes[0].height.toFixed(1)} pt`;
+});
+
+await check("flatten-pdf", async () => {
+  await open("flatten-pdf", ["form.pdf"]);
+  const f = await runAndDownload("Flatten forms");
+  const d = await PDFDocument.load(readFileSync(f));
+  const fields = d.getForm().getFields().length;
+  const text = execFileSync("pdftotext", [f, "-"]).toString();
+  if (fields !== 0 || !text.includes("Ada Lovelace")) throw new Error(`fields=${fields} text=${text.slice(0, 80)}`);
+  return "0 fields left, value kept as text";
+});
+
+await check("edit-metadata", async () => {
+  await open("edit-metadata", ["form.pdf"]);
+  const title = page.getByLabel("Title", { exact: true });
+  await page.waitForFunction(() => document.querySelector("#opt-title")?.value === "Old title", null, { timeout: 5000 });
+  await title.fill("New title");
+  await setField("Author", "");
+  const f = await runAndDownload("Save metadata");
+  const d = await PDFDocument.load(readFileSync(f), { updateMetadata: false });
+  if (d.getTitle() !== "New title" || d.getAuthor() !== undefined) throw new Error(`${d.getTitle()} / ${d.getAuthor()}`);
+  return "prefilled; title changed, author removed";
+});
+
+await check("rotate-image", async () => {
+  await open("rotate-image", ["photo.jpg"]);
+  const id = identify(await runAndDownload("Apply"));
+  if (!id.includes("800x1200")) throw new Error(id);
+  return id;
+});
+
+await check("watermark-image", async () => {
+  await open("watermark-image", ["photo.jpg"]);
+  await selectField("Position", "tile");
+  const f = await runAndDownload("Add watermark");
+  const id = identify(f);
+  return `${id}`;
+});
+
+for (const [slug, file, action, verify] of [
+  ["grayscale-pdf", "sample.pdf", "Convert to grayscale", (f) => {
+    execFileSync("pdftoppm", ["-png", "-r", "30", "-f", "1", "-l", "1", f, `${OUT}/gray`]);
+    const sat = execFileSync("convert", [`${OUT}/gray-1.png`, "-colorspace", "HSL", "-channel", "G", "-separate", "-format", "%[fx:maxima]", "info:"]).toString();
+    if (Number(sat) > 0.02) throw new Error(`saturation ${sat}`);
+    return "no colour left";
+  }],
+  ["repair-pdf", "broken.pdf", "Repair PDF", async (f) => {
+    const i = await pdfInfo(f);
+    if (i.pages !== 3) throw new Error(`pages=${i.pages}`);
+    execFileSync("qpdf", ["--check", f]);
+    return "3 pages recovered, passes qpdf --check";
+  }],
+  ["pdf-to-pdfa", "sample.pdf", "Convert to PDF/A", (f) => {
+    const meta = execFileSync("pdfinfo", ["-meta", f]).toString();
+    if (!/pdfaid:part(="|>)2/.test(meta)) throw new Error("no PDF/A marker");
+    return "PDF/A-2 metadata present";
+  }],
+  ["image-to-text", "scan.png", "Extract text", (f) => {
+    const t = readFileSync(f, "utf8");
+    if (!t.includes("4417")) throw new Error(t);
+    return JSON.stringify(t.trim());
+  }],
+  ["office-to-pdf", "page.html", "Convert to PDF", async (f) => {
+    const t = execFileSync("pdftotext", [f, "-"]).toString();
+    const { pages } = await pdfInfo(f);
+    if (!t.includes("Hello HTML") || pages !== 1) throw new Error(`pages=${pages} text=${t.slice(0, 80)}`);
+    return "HTML converted (heading kept, 1 page)";
+  }],
+]) {
+  await check(`${slug} (server)`, async () => {
+    await open(slug, [file]);
+    return verify(await runAndDownload(action));
+  });
+}
+
 await check("compress-pdf (server via UI)", async () => {
   await open("compress-pdf", ["heavy.pdf"]);
   const f = await runAndDownload("Compress PDF");
@@ -269,7 +380,6 @@ await page.emulateMedia({ colorScheme: "dark" });
 await page.screenshot({ path: `${OUT}/home-dark.png` });
 
 await browser.close();
-for (const [s, n, d] of results) console.log(`${s}  ${n.padEnd(30)} ${d}`);
 console.log(`\n${results.filter((r) => r[0] === "PASS").length}/${results.length} passed`);
 if (consoleErrors.length) console.log("Console errors:\n" + [...new Set(consoleErrors)].join("\n"));
 process.exit(results.every((r) => r[0] === "PASS") ? 0 : 1);

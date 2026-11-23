@@ -18,6 +18,22 @@ for (let i = 1; i <= 3; i++) {
   if (i === 3) p.setRotation(degrees(90)); // exercises rotated-page handling
 }
 writeFileSync(`${process.env.FIX}/sample.pdf`, await doc.save());
+
+// A fillable form with document metadata, for Flatten and Edit metadata.
+const form = await PDFDocument.create();
+form.setTitle("Old title");
+form.setAuthor("Old author");
+const fp = form.addPage([595, 842]);
+fp.drawText("Name:", { x: 60, y: 720, size: 14, font: await form.embedFont(StandardFonts.Helvetica) });
+const field = form.getForm().createTextField("name");
+field.setText("Ada Lovelace");
+field.addToPage(fp, { x: 120, y: 712, width: 240, height: 24 });
+writeFileSync(`${process.env.FIX}/form.pdf`, await form.save());
+
+// sample.pdf with its cross-reference table destroyed, for Repair PDF.
+const good = Buffer.from(await doc.save({ useObjectStreams: false }));
+const cut = good.lastIndexOf("xref");
+writeFileSync(`${process.env.FIX}/broken.pdf`, Buffer.concat([good.subarray(0, cut), Buffer.from("garbage\n%%EOF")]));
 JS
 
 cd "$F"
@@ -29,5 +45,6 @@ convert -size 2400x3200 plasma:fractal -quality 95 big.jpg
 convert big.jpg big.jpg big.jpg -quality 95 heavy.pdf
 rm big.jpg
 printf 'Quarterly report\n\nRevenue grew 12 percent.\n' > report.txt
+printf '<html><body><h1>Hello HTML</h1><p>Converted by Pagecraft</p></body></html>' > page.html
 soffice --headless --convert-to docx report.txt >/dev/null
 echo "Fixtures written to $(pwd)"

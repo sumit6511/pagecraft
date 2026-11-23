@@ -3,13 +3,27 @@
 import JSZip from "jszip";
 import { ToolError, baseName, parsePageSet } from "../pages";
 import type { ToolDef } from "../tools";
-import { compressImages, convertImages, cropImage, removeMetadata, resizeImages, type CropRect } from "./images";
+import {
+  compressImages,
+  convertImages,
+  cropImage,
+  removeMetadata,
+  resizeImages,
+  rotateImages,
+  watermarkImages,
+  type CropRect,
+} from "./images";
 import {
   addPageNumbers,
+  cropPdf,
+  editMetadata,
   extractPages,
+  flattenPdf,
   imagesToPdf,
   mergePdfs,
   organizePdf,
+  pagesPerSheet,
+  readMetadata,
   removePages,
   rotatePdf,
   signPdf,
@@ -47,6 +61,45 @@ async function pdfToImages(file: File, o: Record<string, string>, onProgress?: (
   }
 }
 
+async function pdfToText(files: File[], o: Record<string, string>, onProgress?: (p: number) => void): Promise<Output[]> {
+  const out: Output[] = [];
+  for (const [fi, file] of files.entries()) {
+    const doc = await openPdfForRender(await file.arrayBuffer());
+    try {
+      const pages = parsePageSet(o.pages ?? "", doc.numPages);
+      const parts: string[] = [];
+      for (const [k, i] of pages.entries()) {
+        const page = await doc.getPage(i + 1);
+        const content = await page.getTextContent();
+        let text = "";
+        for (const item of content.items) {
+          if (!("str" in item)) continue;
+          text += item.str + (item.hasEOL ? "\n" : "");
+        }
+        page.cleanup();
+        parts.push(o.separators === "true" ? `──── Page ${i + 1} ────\n${text.trim()}` : text.trim());
+        onProgress?.((fi + (k + 1) / pages.length) / files.length);
+      }
+      const body = parts.join("\n\n") + "\n";
+      const empty = parts.every((p) => !p.replace(/──── Page \d+ ────/, "").trim());
+      out.push({
+        name: `${baseName(file.name)}.txt`,
+        blob: new Blob([body], { type: "text/plain;charset=utf-8" }),
+        note: empty ? "No text found. If this is a scan, run OCR PDF first." : undefined,
+      });
+    } finally {
+      await doc.loadingTask.destroy();
+    }
+  }
+  return out;
+}
+
+/** Options read from the chosen file, for tools marked `prefill`. */
+export async function prefillOptions(tool: ToolDef, file: File): Promise<Record<string, string>> {
+  if (tool.slug === "edit-metadata") return readMetadata(file);
+  return {};
+}
+
 export async function runClientTool(
   tool: ToolDef,
   files: File[],
@@ -65,6 +118,20 @@ export async function runClientTool(
       return organizePdf(first, editor.plan);
     case "rotate-pdf":
       return rotatePdf(files, opts);
+    case "pages-per-sheet":
+      return pagesPerSheet(first, opts);
+    case "pdf-to-text":
+      return pdfToText(files, opts, onProgress);
+    case "rotate-image":
+      return rotateImages(files, opts);
+    case "watermark-image":
+      return watermarkImages(files, opts);
+    case "crop-pdf":
+      return cropPdf(files, opts);
+    case "flatten-pdf":
+      return flattenPdf(files);
+    case "edit-metadata":
+      return editMetadata(first, opts);
     case "remove-pages":
       return removePages(first, opts);
     case "extract-pages":
@@ -140,6 +207,8 @@ function guessType(name: string) {
   const e = name.split(".").pop()?.toLowerCase();
   return e === "pdf"
     ? "application/pdf"
+    : e === "txt"
+      ? "text/plain;charset=utf-8"
     : e === "docx"
       ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
       : "application/octet-stream";

@@ -3,7 +3,7 @@
 import { ArrowDown, ArrowUp, CircleAlert, CircleCheck, Download, FileText, LoaderCircle, RotateCcw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ToolError } from "@/lib/pages";
-import { runClientTool, runServerTool, zipOutputs, type EditorState } from "@/lib/client/run";
+import { prefillOptions, runClientTool, runServerTool, zipOutputs, type EditorState } from "@/lib/client/run";
 import type { Output } from "@/lib/client/types";
 import type { CropRect } from "@/lib/client/images";
 import type { OrganizeItem, SignPlacement } from "@/lib/client/pdf";
@@ -55,6 +55,12 @@ export function ToolWorkspace({ slug }: { slug: string }) {
     const items = picked.map((file) => ({ id: crypto.randomUUID(), file }));
     setFiles((prev) => (tool.multiple ? [...prev, ...items] : items.slice(0, 1)));
     setStatus({ kind: "idle" });
+    if (tool.prefill) {
+      // Show the file's current values (e.g. its title) so the user edits rather than retypes.
+      prefillOptions(tool, picked[0])
+        .then((values) => setOpts({ ...defaultOptions(tool), ...values }))
+        .catch((err) => setNotice(err instanceof Error ? err.message : "Couldn't read this file."));
+    }
   };
 
   const onOrganize = useCallback((plan: OrganizeItem[]) => setEditor({ kind: "organize", plan }), []);
