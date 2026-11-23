@@ -1,0 +1,14 @@
+services:
+  pagecraft:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      MAX_UPLOAD_MB: "100"
+      MAX_CONCURRENT_JOBS: "2"
+      RATE_LIMIT_PER_MIN: "20"
+    # LibreOffice and OCR are memory-hungry; give the container room.
+    mem_limit: 2g
+    tmpfs:
+      - /tmp:size=1g
+    restart: unless-stopped

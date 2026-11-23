@@ -1,36 +1,117 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Pagecraft
 
-## Getting Started
+Free, self-hostable PDF, document and image tools. Merge, split, compress, convert,
+sign and protect PDFs, turn Office files into PDFs, and edit images.
 
-First, run the development server:
+**16 of the 22 tools run entirely in the browser**, so those files never leave the user's
+device. The other 6 need native software (LibreOffice, Ghostscript, qpdf, OCRmyPDF) and
+run on the server; uploads are processed in a private temp folder and deleted immediately.
+
+## Tools
+
+| Group | Tool | Runs in | Engine |
+| --- | --- | --- | --- |
+| Organize | Merge PDF, Split PDF, Organize PDF (visual reorder/rotate/delete), Rotate PDF, Remove pages, Extract pages | Browser | pdf-lib, pdf.js |
+| Convert | PDF → image (JPG/PNG/WebP), Image → PDF | Browser | pdf.js, pdf-lib |
+| Convert | Office → PDF (Word, Excel, PowerPoint, OpenDocument, RTF, TXT, CSV) | Server | LibreOffice |
+| Convert | PDF → Word (DOCX) | Server | LibreOffice |
+| Image | Compress, Resize, Convert (JPG/PNG/WebP), Crop (visual), Remove metadata (lossless EXIF/XMP strip) | Browser | Canvas |
+| Edit | Watermark, Page numbers, Sign PDF (draw or type, drag to place) | Browser | pdf-lib |
+| Optimize & secure | Compress PDF | Server | Ghostscript |
+| Optimize & secure | Protect PDF (AES-256), Unlock PDF | Server | qpdf |
+| Optimize & secure | OCR PDF (searchable scans) | Server | OCRmyPDF + Tesseract |
+
+Rotated pages are handled correctly: watermarks, page numbers and signatures are placed
+relative to what the reader sees, not the page's internal coordinates.
+
+## Run it
+
+### Docker (recommended)
+
+The image bundles Node and every converter.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+docker compose up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open http://localhost:3000. `GET /api/health` reports which converters are available.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Local development
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Needs Node.js 22+. The browser tools work with nothing else. For the server tools, install
+the converters (Debian/Ubuntu shown):
 
-## Learn More
+```bash
+sudo apt-get install libreoffice-writer libreoffice-calc libreoffice-impress ghostscript qpdf ocrmypdf tesseract-ocr-eng
+```
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npm install
+npm run dev
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Configuration
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MAX_UPLOAD_MB` | `100` | Total upload size per request to server tools |
+| `MAX_FILES` | `20` | Files per request |
+| `MAX_CONCURRENT_JOBS` | `2` | Server conversions running at once; more are queued |
+| `MAX_QUEUED_JOBS` | `20` | Queue length before the server answers "busy" |
+| `RATE_LIMIT_PER_MIN` | `20` | Server-tool requests per client per minute |
+| `TRUST_PROXY` | unset | Set to `1` behind a reverse proxy you control, to rate-limit by `X-Forwarded-For` |
+| `SOFFICE_BIN`, `GS_BIN`, `QPDF_BIN`, `OCRMYPDF_BIN` | on `PATH` | Override converter locations |
 
-## Deploy on Vercel
+## How it's built
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- **Next.js 16** (App Router, Cache Components, standalone output), **TypeScript**, **Tailwind CSS 4**.
+- `src/lib/tools.ts` is the single registry. Every tool's name, category, accepted files,
+  options and where it runs. Pages, the home grid, the options form and server-side option
+  validation are all generated from it.
+- `src/lib/client/`: browser implementations (`pdf.ts`, `images.ts`, pdf.js rendering in `render.ts`).
+- `src/lib/server/`: server implementations. Converters are started with `execFile` (no shell),
+  each job gets its own temp directory that is always removed, and passwords reach qpdf
+  through a `0600` argument file so they never appear in the process list.
+- `src/app/api/tools/[slug]/route.ts`: one endpoint for all server tools, with size, count,
+  type, option, rate and concurrency checks.
+- `src/components/ToolWorkspace.tsx`: the shared drop → options → run → download flow;
+  `components/editors/` holds the visual Organize, Sign and Crop editors.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### Adding a tool
+
+1. Add an entry to `TOOLS` in `src/lib/tools.ts` (fields become the options form automatically).
+2. Implement it in `src/lib/client/run.ts` (browser) or `src/lib/server/run.ts` (server).
+3. Add an icon in `src/components/ToolIcon.tsx`.
+
+### Adding OCR languages
+
+Install the Tesseract language pack (for example `tesseract-ocr-deu`), then add the code to
+the OCR tool's `language` options in `tools.ts` and to `OCR_LANGS` in `src/lib/server/run.ts`.
+
+## Testing
+
+```bash
+npm run typecheck && npm run lint
+```
+
+End-to-end: generates sample files, then drives every tool in Chromium and checks each
+output (page counts, rotation, dimensions, extracted text, metadata). Needs Playwright with
+Chromium, ImageMagick, poppler-utils and LibreOffice.
+
+```bash
+npm run test:fixtures
+```
+
+```bash
+BASE=http://localhost:3000 npm run test:e2e
+```
+
+## Known limits
+
+- **PDF → Word** uses LibreOffice's PDF import. Text and simple layouts convert well;
+  complex multi-column layouts may need touch-ups.
+- **Browser image tools** are limited by canvas size (about 16 megapixels in Safari).
+- **Rate limiting and the job queue are in memory**, so they apply per instance. Use a shared
+  store (e.g. Redis) if you run several instances.
+- The built-in PDF fonts cover Latin text; watermark text in other scripts is rejected with a
+  clear message rather than drawn incorrectly.
